@@ -1,216 +1,92 @@
-
-#!/usr/bin/env python3
-"""
-AI Insights Agent (DeepSeek) — Adapter for Performance Monitor dashboard
-
-What it does
-------------
-Reads your aiPerformanceFiles/*_ai-summary-targets_*.csv files and asks DeepSeek
-to draft 4 short executive insights for each (Market, Period):
-
-- critical_alert
-- trend_analysis
-- retention_issue
-- opportunity
-
-It then writes (all into aiPerformanceText/):
-  1) anomalies_YYYY-MM-DD.json  -> full structured list
-  2) YYYY-MM-DD_main-insights.js -> window.AI_INSIGHTS = {..} for the dashboard.
-
-Integration (minimal)
----------------------
-In your build_dashboard_Final.py template HTML:
-1) Include the dated file (today):
-   <script src="aiPerformanceText/YYYY-MM-DD_main-insights.js"></script>
-
-2) Give ids to the four insight boxes:
-   <div class="insight-box" id="insCritical">...</div>
-   <div class="insight-box" id="insTrend">...</div>
-   <div class="insight-box" id="insRetention">...</div>
-   <div class="insight-box" id="insOpportunity">...</div>
-
-3) In the <script> of the HTML, add a function and hook into refreshAll():
-   function renderInsights(){
-     const p = document.getElementById('periodSelect').value;
-     const m = document.getElementById('marketSelect').value;
-     const data = (window.AI_INSIGHTS && window.AI_INSIGHTS[m] && window.AI_INSIGHTS[m][p]) || null;
-     const setText = (id, txt) => { const el = document.getElementById(id); if (el) el.innerHTML = txt || '[No insight]'; };
-     setText('insCritical', data ? (data.critical_alert || '[No insight]') : '[No insight]');
-     setText('insTrend', data ? (data.trend_analysis || '[No insight]') : '[No insight]');
-     setText('insRetention', data ? (data.retention_issue || '[No insight]') : '[No insight]');
-     setText('insOpportunity', data ? (data.opportunity || '[No insight]') : '[No insight]');
-   }
-   // call it when filters change and on init:
-   function refreshAll(){ renderCards(); renderStacked(); renderGauges(); renderInsights(); }
-
-Notes
------
-- If DEEPSEEK_API_KEY is missing or the API fails, the script falls back to
-  deterministic heuristics so you still get useful insights.
-- The prompt is concise and asks DeepSeek to return strict JSON. We additionally
-  sanitize/repair the JSON if the model returns code fences or extra prose.
-
-Author: IA Project
-"""
-
-import os, re, json, glob, time
-from io import StringIO
+import os, re, json, glob
 from datetime import date
 from typing import List, Dict, Any, Tuple
 import pandas as pd
-
-def _cleanup_old_ai_text(dir_path: str, today: str):
-    """Delete generated files older than `today` in aiPerformanceText/.
-    Matches BOTH naming schemes:
-      1) anomalies_YYYY-MM-DD.json
-      2) YYYY-MM-DD_anomalies.json
-      3) YYYY-MM-DD_main-insights.js/json
-    """
-    try:
-        import re, os, glob
-        patt_a1 = re.compile(r'^anomalies_(\d{4}-\d{2}-\d{2})\.json$', re.I)
-        patt_a2 = re.compile(r'^(\d{4}-\d{2}-\d{2})_anomalies\.json$', re.I)
-        patt_js = re.compile(r'^(\d{4}-\d{2}-\d{2})_main-insights\.(?:js|json)$', re.I)
-        for fp in glob.glob(os.path.join(dir_path, '*')):
-            base = os.path.basename(fp)
-            m = patt_a1.match(base) or patt_a2.match(base) or patt_js.match(base)
-            if not m:
-                continue
-            file_date = m.group(1)
-            if file_date < today:
-                try:
-                    os.remove(fp)
-                    print('🧹 Deleted old file:', base)
-                except Exception as e:
-                    print('⚠️ Could not delete', base, '->', e)
-    except Exception as e:
-        print('⚠️ Cleanup failed:', e)
-    """
-    Delete any generated files with a date prefix older than today, e.g.:
-      YYYY-MM-DD_main-insights.js
-      anomalies_YYYY-MM-DD.json
-    """
-    try:
-        import re, os, glob
-        patt_js = re.compile(r"^(\d{4}-\d{2}-\d{2})_main-insights\.js$")
-        patt_json = re.compile(r"^anomalies_(\d{4}-\d{2}-\d{2})\.json$")
-        for fp in glob.glob(os.path.join(dir_path, "*")):
-            base = os.path.basename(fp)
-            m = patt_js.match(base) or patt_json.match(base)
-            if m and m.group(1) < today:
-                try:
-                    os.remove(fp)
-                    print("🧹 Deleted old file:", fp)
-                except Exception as e:
-                    print("⚠️ Could not delete", fp, "->", e)
-    except Exception as e:
-        print("⚠️ Cleanup failed:", e)
+import math
 
 # ---------------------------
 # Configuration
 # ---------------------------
-BASE_DIR = os.path.dirname(__file__) if '__file__' in globals() else "."
-FILES_DIR = os.path.join(BASE_DIR, "aiPerformanceFiles")
+BASE_DIR   = os.path.dirname(__file__) if "__file__" in globals() else "."
+FILES_DIR  = os.path.join(BASE_DIR, "aiPerformanceFiles")
 OUTPUT_DIR = os.path.join(BASE_DIR, "aiPerformanceText")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(FILES_DIR, exist_ok=True)
+os.makedirs(FILES_DIR,  exist_ok=True)
 
-# You can tailor the markets you care about here. We'll auto-detect from filenames too.
-VALID_MARKETS = ["ALL","AE","QA","SA","JO","BH","NZ","KW","EG","GCC","BET","Others"]
+VALID_MARKETS = ["ALL","AE","QA","SA","JO","BH","NZ","KW","EG","GCC","BET","Others","OTHERS"]
+DRILLDOWN = {
+    "ALL": ["AE","QA","SA","JO","BH","NZ","KW","EG","Others"],
+    "GCC": ["AE","QA","SA","JO","BH","KW"],
+    "BET": ["NZ"],
+}
 
 # ---------------------------
-# Optional DeepSeek client
+# Utils
 # ---------------------------
-def _get_deepseek_client():
-    """
-    Lazily import OpenAI with a DeepSeek base_url if the API key is present.
-    Returns (client, is_available: bool).
-    """
-    api = os.getenv("DEEPSEEK_API_KEY")
-    if not api:
-        return None, False
+def _fmt_num(x, decimals=0):
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api, base_url="https://api.deepseek.com/v1")
-        return client, True
-    except Exception as e:
-        print("⚠️ Failed to initialize DeepSeek client:", e)
-        return None, False
+        v = float(x)
+        if abs(v) >= 1000:
+            return f"{v:,.0f}"
+        return f"{v:,.{decimals}f}" if decimals>0 else f"{v:,.0f}"
+    except Exception:
+        return ""
 
-def _safe_chat_complete(client, messages, retries=2, delay=8):
-    """
-    Call DeepSeek with exponential backoff.
-    """
-    last_err = None
-    for i in range(retries+1):
-        try:
-            resp = client.chat.completions.create(
-                model="deepseek-chat",
-                messages=messages,
-                temperature=0.2,
-            )
-            return resp
-        except Exception as e:
-            last_err = e
-            print(f"⚠️ DeepSeek error (attempt {i+1}/{retries+1}): {e}")
-            time.sleep(delay * (i+1))
-    raise last_err
+def _pretty_metric(s: str) -> str:
+    u = str(s or "").strip().upper()
+    if u in {"DEPS","DEPOSITS","DEPOSIT"}: return "Deposits"
+    if u == "FTDS": return "FTDs"
+    if u == "GGR": return "GGR"
+    if u == "NGR": return "NGR"
+    if u == "MARGIN": return "Margin"
+    if u == "RETENTION": return "Retention"
+    return str(s).strip()
+
+def _cleanup_old_ai_text(dir_path: str, today: str):
+    patt_a1 = re.compile(r'^anomalies_(\d{4}-\d{2}-\d{2})\.json$', re.I)
+    patt_js = re.compile(r'^(\d{4}-\d{2}-\d{2})_main-insights\.(?:js|json)$', re.I)
+    for fp in glob.glob(os.path.join(dir_path, '*')):
+        base = os.path.basename(fp)
+        m = patt_a1.match(base) or patt_js.match(base)
+        if not m:
+            continue
+        file_date = m.group(1)
+        if file_date < today:
+            try:
+                os.remove(fp)
+            except Exception:
+                pass
 
 # ---------------------------
-# CSV utils
+# Loaders (DIFFERENCES as the main source)
 # ---------------------------
-
-# ---------- Metric aliases & pretty names ----------
-DEPS_ALIASES = {"DEPS","DEPOSITS","DEPOSIT"}
-NGR_ALIASES = {"NGR"}
-MARGIN_ALIASES = {"MARGIN"}
-RETENTION_ALIASES = {"RETENTION"}
-
-def _metric_match(s, aliases):
-    return str(s).strip().upper() in aliases
-
-def _pretty_metric(s):
-    u = str(s).strip().upper()
-    if u in DEPS_ALIASES: return "Deposits"
-    if u in MARGIN_ALIASES: return "Margin"
-    if u in RETENTION_ALIASES: return "Retention"
-    if u in NGR_ALIASES: return "NGR"
-    return str(s).strip().title()
-
-
-def read_csvs_summary() -> pd.DataFrame:
-    """
-    Load *summary-targets* CSVs and normalize column names.
-    Expected columns (best-effort): Period, Country, METRIC, VALUE, TARGET, DIFF_PERCENTAGE, DIFF_ABSOLUTE, Date
-    """
-    def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty:
-            return pd.DataFrame()
+def read_csvs_differences() -> pd.DataFrame:
+    def normalize(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty: return pd.DataFrame()
         rename_map = {}
         for c in df.columns:
             lc = str(c).lower().strip()
-            if lc in ["metric","kpi"]:
-                rename_map[c] = "METRIC"
-            elif lc in ["country","market"]:
-                rename_map[c] = "Country"
-            elif lc == "period":
-                rename_map[c] = "Period"
-            elif lc in ["value","amount","current_value","current"]:
-                rename_map[c] = "VALUE"
-            elif lc == "target":
-                rename_map[c] = "TARGET"
-            elif lc in ["diff_percentage","diff %","diffpct","diffpercent","diff_percentage_%"]:
-                rename_map[c] = "DIFF_PERCENTAGE"
-            elif lc == "date":
-                rename_map[c] = "Date"
-            elif lc in ["diff_abs","diff_absolute","difference_absolute","delta"]:
-                rename_map[c] = "DIFF_ABSOLUTE"
+            if lc in ["market","country"]: rename_map[c] = "Market"
+            elif lc == "period": rename_map[c] = "Period"
+            elif lc in ["metric","kpi"]: rename_map[c] = "METRIC"
+            elif lc in ["value","current","current_value","amount"]: rename_map[c] = "VALUE"
+            elif lc in ["previous","prev","prior"]: rename_map[c] = "Previous"
+            elif lc in ["diff_absolute","diff_abs","delta"]: rename_map[c] = "DIFF_ABSOLUTE"
+            elif lc in ["diff_percentage","diffpct","diff%","diff percent","diff_%"]: rename_map[c] = "DIFF_PERCENTAGE"
         out = df.rename(columns=rename_map)
-        out.columns = [str(c).strip() for c in out.columns]
+        for col in ["Market","Period","METRIC","VALUE","Previous","DIFF_ABSOLUTE","DIFF_PERCENTAGE"]:
+            if col not in out.columns: out[col] = None
+        out["Market"]          = out["Market"].astype(str)
+        out["Period"]          = out["Period"].astype(str)
+        out["METRIC"]          = out["METRIC"].astype(str)
+        out["VALUE"]           = pd.to_numeric(out["VALUE"], errors="coerce")
+        out["Previous"]        = pd.to_numeric(out["Previous"], errors="coerce")
+        out["DIFF_ABSOLUTE"]   = pd.to_numeric(out["DIFF_ABSOLUTE"], errors="coerce")
+        out["DIFF_PERCENTAGE"] = pd.to_numeric(out["DIFF_PERCENTAGE"], errors="coerce")
         return out
 
     dfs = []
-    for f in glob.glob(os.path.join(FILES_DIR, "*_ai-summary-targets_*.csv")):
+    for f in glob.glob(os.path.join(FILES_DIR, "*_ai-summary-differences_*.csv")):
         try:
             df = pd.read_csv(f)
         except Exception:
@@ -218,29 +94,40 @@ def read_csvs_summary() -> pd.DataFrame:
                 df = pd.read_csv(f, encoding="latin-1")
             except Exception:
                 df = pd.DataFrame()
-        if df.empty:
-            continue
-        df = normalize_columns(df)
-        # Ensure required columns exist
-        for col in ["Period","Country","METRIC","VALUE","TARGET","DIFF_PERCENTAGE","DIFF_ABSOLUTE","Date"]:
-            if col not in df.columns:
-                df[col] = None
-        # Coerce
-        df["Period"] = df["Period"].fillna("Yesterday").astype(str)
-        df["Country"] = df["Country"].fillna("ALL").astype(str)
-        df["METRIC"] = df["METRIC"].fillna("UNKNOWN").astype(str)
-        dfs.append(df)
+        if not df.empty:
+            dfs.append(normalize(df))
     if not dfs:
-        return pd.DataFrame(columns=["Period","Country","METRIC","VALUE","TARGET","DIFF_PERCENTAGE","DIFF_ABSOLUTE","Date"])
-    out = pd.concat(dfs, ignore_index=True)
+        return pd.DataFrame(columns=["Market","Period","METRIC","VALUE","Previous","DIFF_ABSOLUTE","DIFF_PERCENTAGE"])
+    return pd.concat(dfs, ignore_index=True)
+
+def read_groups_csv(market_code: str) -> pd.DataFrame:
+    candidates = glob.glob(os.path.join(FILES_DIR, f"*ai-summary-groups_{market_code}.csv"))
+    if not candidates:
+        return pd.DataFrame(columns=["Period","Market","METRIC","FTD_Group","VALUE","PREVIOUS","DIFF_ABSOLUTE","DIFF_PERCENTAGE"])
+    latest = sorted(candidates)[-1]
+    try:
+        df = pd.read_csv(latest)
+    except Exception:
+        df = pd.read_csv(latest, encoding="latin-1")
+
+    rename_map = {
+        "market":"Market","country":"Market","period":"Period","metric":"METRIC",
+        "ftd_group":"FTD_Group","previous":"PREVIOUS","diff_absolute":"DIFF_ABSOLUTE",
+        "diff_percentage":"DIFF_PERCENTAGE"
+    }
+    out = df.rename(columns={c: rename_map.get(c.lower(), c) for c in df.columns})
+    for col in ["VALUE","PREVIOUS","DIFF_ABSOLUTE","DIFF_PERCENTAGE"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
     return out
 
 def markets_from_files(df: pd.DataFrame) -> List[str]:
-    if df.empty: 
-        return VALID_MARKETS
-    ms = sorted(df["Country"].dropna().astype(str).str.upper().unique().tolist())
-    # keep known order with extras appended
-    order = [m for m in VALID_MARKETS if m in ms]
+    if df.empty:
+        return [m for m in VALID_MARKETS if m != "OTHERS"]
+    ms = sorted(df["Market"].dropna().astype(str).str.upper().unique().tolist())
+    # Normalize "OTHERS" to "Others" in list
+    ms = [("Others" if m == "OTHERS" else m) for m in ms]
+    order = [m for m in ["ALL","GCC","BET","AE","QA","SA","JO","BH","KW","EG","NZ","Others"] if m in ms]
     extras = [m for m in ms if m not in order]
     return order + extras
 
@@ -250,376 +137,265 @@ def periods_from_df(df: pd.DataFrame) -> List[str]:
     return sorted(df["Period"].dropna().astype(str).unique().tolist())
 
 # ---------------------------
-# LLM prompt + parse
+# Anomaly detection helpers
 # ---------------------------
-LLM_SYSTEM = "You are a Chief Analytics Officer reviewing casino affiliates acquisition KPIs."
-LLM_USER_TEMPLATE = """Analyze the affiliate acquisition performance for MARKET = {market} and PERIOD = {period}.
-Use the CSV below (subset of ai-summary-targets) containing columns like Period, Country, METRIC, VALUE, TARGET, DIFF_PERCENTAGE, DIFF_ABSOLUTE, Date.
+def _select_anomalous_rows(df_sub: pd.DataFrame, top_n: int = 5, min_abs_pct: float = 25.0) -> pd.DataFrame:
+    d = df_sub.copy()
+    d = d[pd.notna(d["DIFF_PERCENTAGE"])]
+    d["ABS__"] = d["DIFF_PERCENTAGE"].abs()
+    d = d.sort_values(["ABS__","DIFF_ABSOLUTE"], ascending=[False, False])
+    d = d[d["ABS__"] >= min_abs_pct]
+    return d.head(top_n)
 
-Return a STRICT JSON array with at most 4 objects (one per category). Follow these preferences hard: critical_alert should preferably be on DEPS/Deposits (if present), trend_analysis should preferably be on NGR, opportunity should preferably be on MARGIN and must be unique (do not repeat another comment), and avoid phrases like "is a small base". 
-[
-  {{
-    "type": "critical_alert" | "trend_analysis" | "retention_issue" | "opportunity",
-    "metric": "<metric>",
-    "market": "{market}",
-    "period": "{period}",
-    "finding": "<1–2 sentences with concrete figures and %>",
-    "impact": "<High|Medium|Low + short impact description>",
-    "confidence": <0.0–1.0>,
-    "suggested_action": "<short actionable step>"
-  }}
-]
+def _drilldown_ftd_group(metric: str, period: str, parent_market: str, sign: int) -> Tuple[str,str,Dict[str,float]]:
+    sub_markets = DRILLDOWN.get(parent_market.upper(), [parent_market.upper()])
+    best_score, best_row, best_market = None, None, None
+    for m in sub_markets:
+        gdf = read_groups_csv(m)
+        if gdf.empty:
+            continue
+        block = gdf[(gdf["Period"].astype(str)==period) & (gdf["METRIC"].astype(str).str.upper()==metric.upper())].copy()
+        if block.empty:
+            continue
+        block = block.sort_values("DIFF_PERCENTAGE", ascending=(sign<0))
+        row   = block.iloc[0]
+        score = abs(float(row.get("DIFF_PERCENTAGE") or 0))
+        if (best_score is None) or (score > best_score):
+            best_score, best_row, best_market = score, row, m
+    if best_row is None:
+        return (parent_market, None, {})
+    fig = {
+        "value":      float(best_row.get("VALUE", 0) or 0),
+        "previous":   float(best_row.get("PREVIOUS", 0) or 0),
+        "diff_abs":   float(best_row.get("DIFF_ABSOLUTE", 0) or 0),
+        "diff_pct":   float(best_row.get("DIFF_PERCENTAGE", 0) or 0),
+    }
+    return (best_market, str(best_row.get("FTD_Group")), fig)
 
-Rules:
-- Prioritize metrics with the largest negative DIFF_PERCENTAGE for critical_alert.
-- Use RETENTION for retention_issue when possible; otherwise pick a related drop-off metric.
-- For opportunity, pick a smaller-volume metric/segment that is growing or above target.
-- Be concise, keep numbers readable (use % and $ when suitable). 
-- Respond with JSON ONLY — no backticks, no prose, no explanations.
-CSV:
-{csv_text}
-"""
+def _is_currency_metric(metric: str) -> bool:
+    u = str(metric or "").upper().strip()
+    return u in {"DEPS","DEPOSITS","DEPOSIT","STAKE","NGR","GGR"}
 
-def _extract_json(text: str) -> List[Dict[str, Any]]:
-    if text is None:
-        return []
-    t = text.strip()
-    # Remove code fences
-    if t.startswith("```"):
-        t = re.sub(r"^```(?:json)?", "", t, flags=re.I).strip()
-        if t.endswith("```"):
-            t = t[:-3].strip()
-    # Try direct JSON
+def _is_percent_metric(metric: str) -> bool:
+    u = str(metric or "").upper().strip()
+    return u in {"MARGIN","RETENTION"}
+
+_SEGMENT_LONG = {
+    "[FTDs]": "new players",
+    "[1-3]": "the segment of users that have made their first deposit between one and three months ago",
+    "[4-12]": "the segment of users that have made their first deposit between four and twelve months ago",
+    "[13-24]": "the segment of users that have made their first deposit between one and two years ago",
+    "[> 25]": "the segment of users that have made their first deposit more than two years ago",
+}
+
+def _normalize_segment_tag(tag: str) -> str:
+    if not tag: return ""
+    t = str(tag).strip()
+    t = t.replace("[ >25]", "[> 25]").replace("[>25]", "[> 25]")
+    if not t.startswith("["): t = f"[{t}]"
+    return t
+
+def _segment_phrase(ftd_group: str) -> str:
+    tg = _normalize_segment_tag(ftd_group)
+    if tg in _SEGMENT_LONG:
+        return _SEGMENT_LONG[tg]
+    return "the overall mix of segments"
+
+def _fmt_with_unit(metric: str, value) -> str:
+    if value is None or (isinstance(value, float) and (pd.isna(value) or not math.isfinite(value))):
+        return ""
+    if _is_currency_metric(metric):
+        return f"${_fmt_num(value)}"
+    if _is_percent_metric(metric):
+        return f"{_fmt_num(value)}%"
+    return _fmt_num(value)
+
+def _location_prefix(metric: str, area_market: str) -> str:
+    mname = _pretty_metric(metric)
+    am = str(area_market or "").strip()
+    if am.lower() == "general":
+        return f"General {mname}"
+    if am.upper() in {"OTHERS","OTHERS*"} or am == "Others":
+        return f"In the other countries, the {mname}"
+    return f"In {am}, the {mname}"
+
+def _pct_to_text(prev, val, diff_abs, raw_pct) -> Tuple[str, bool]:
     try:
-        data = json.loads(t)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return [data]
+        pct = float(raw_pct) if raw_pct is not None else None
     except Exception:
-        pass
-    # Bracket extract fallback
-    m = re.search(r"\[.*\]", t, flags=re.S)
-    if m:
-        try:
-            data = json.loads(m.group(0))
-            if isinstance(data, list):
-                return data
-        except Exception:
-            pass
-    return []
+        pct = None
+    if pct is None or not math.isfinite(pct):
+        if (prev is not None) and float(prev) == 0 and (val is not None) and float(val) != 0:
+            return "∞%", (diff_abs or 0) > 0
+        return "0%", (diff_abs or 0) > 0
+    return f"{int(round(abs(pct)))}%", pct >= 0
+
+def _compose_change_phrase(change_word: str, diff_abs_txt: str, pct_txt: str) -> str:
+    diff_abs_txt = (diff_abs_txt or "").strip()
+    if diff_abs_txt:
+        return f"{change_word} {diff_abs_txt} ({pct_txt})"
+    # no absolute value -> speak only in percentages
+    return f"{change_word} {pct_txt}"
+
+def _build_bullet(market: str,
+                  period: str,
+                  metric: str,
+                  row: Dict[str, Any],
+                  area_market: str,
+                  ftd_group: str,
+                  figs: Dict[str, float]) -> Dict[str, Any]:
+    # Prefer drilled figures when available
+    val      = figs.get("value",        row.get("VALUE"))
+    prev     = figs.get("previous",     row.get("Previous"))
+    diff_abs = figs.get("diff_abs",     row.get("DIFF_ABSOLUTE"))
+    raw_pct  = figs.get("diff_pct",     row.get("DIFF_PERCENTAGE"))
+
+    pct_txt, increased = _pct_to_text(prev, val, diff_abs, raw_pct)
+    change_word = "increased" if increased else "decreased"
+
+    title = f"{_pretty_metric(metric)} anomaly"
+    diff_abs_txt = _fmt_with_unit(metric, diff_abs)
+    total_txt    = _fmt_with_unit(metric, val)
+    seg_phrase   = _segment_phrase(ftd_group) if ftd_group else "the overall mix of segments"
+    start        = _location_prefix(metric, area_market)
+
+    change_phrase = _compose_change_phrase(change_word, diff_abs_txt, pct_txt)
+
+    # Build sentence avoiding empty ", to a total of ,"
+    parts = [f"{start} {change_phrase}"]
+    if total_txt:
+        parts.append(f"to a total of {total_txt}")
+    parts.append(f"mainly driven by {seg_phrase}.")
+    text = ", ".join(parts[:-1]) + ", " + parts[-1]
+
+    return {"metric": _pretty_metric(metric), "title": title, "text": text}
+
+def _build_filler_bullet(row: pd.Series, market: str, period: str, mode: str) -> Dict[str, Any]:
+    metric = str(row["METRIC"])
+    val    = row.get("VALUE")
+    prev   = row.get("Previous")
+    diff_a = row.get("DIFF_ABSOLUTE")
+    rawpct = row.get("DIFF_PERCENTAGE")
+    pct_txt, increased = _pct_to_text(prev, val, diff_a, rawpct)
+    mname  = _pretty_metric(metric)
+    total_txt = _fmt_with_unit(metric, val)
+    diff_txt  = _fmt_with_unit(metric, diff_a)
+    area = "General" if market.upper() in DRILLDOWN else market
+    start = _location_prefix(metric, area)
+    if mode == "stability":
+        title = f"{mname} stability"
+        base  = f"{start} remained relatively stable"
+        if total_txt:
+            base += f" at {total_txt}"
+        text  = f"{base} ({pct_txt} vs previous), with no major segment shifts."
+    else:
+        title = f"{mname} trend"
+        trend_word = "increase" if increased else "decrease"
+        base  = f"{start} showed a mild {trend_word}"
+        if diff_txt:
+            base += f" of {diff_txt}"
+        text  = f"{base} ({pct_txt})"
+        if total_txt:
+            text += f" to {total_txt}"
+        text += ", with the overall mix of segments."
+    return {"metric": mname, "title": title, "text": text}
+
+def _ensure_four_bullets(df_diff: pd.DataFrame,
+                         bullets: List[Dict[str, Any]],
+                         market: str, period: str) -> List[Dict[str, Any]]:
+    if len(bullets) >= 4:
+        return bullets[:4]
+
+    sub = df_diff[(df_diff["Market"].str.upper()==market.upper()) & (df_diff["Period"].astype(str)==period)].copy()
+    if sub.empty:
+        while len(bullets) < 4:
+            bullets.append({"metric":"Retention","title":"Retention stability","text":"General Retention remained relatively stable, with no major segment shifts."})
+        return bullets[:4]
+
+    used_metrics = {b.get("metric") for b in bullets}
+
+    # Prefer adding a Retention note if missing
+    ret = sub[sub["METRIC"].astype(str).str.upper()=="RETENTION"]
+    if not ret.empty and "Retention" not in used_metrics and len(bullets) < 4:
+        r = ret.iloc[0]
+        mode = "stability" if abs(float(r.get("DIFF_PERCENTAGE") or 0)) < 10 else "trend"
+        bullets.append(_build_filler_bullet(r, market, period, mode))
+        used_metrics.add("Retention")
+
+    # Fill remaining with smallest |%| first (stability), then larger as trend
+    sub["ABS_"] = sub["DIFF_PERCENTAGE"].abs()
+    for _, r in sub.sort_values("ABS_").iterrows():
+        if len(bullets) >= 4: break
+        mname = _pretty_metric(r["METRIC"])
+        if mname in used_metrics: 
+            continue
+        abs_pct = abs(float(r.get("DIFF_PERCENTAGE") or 0))
+        mode = "stability" if abs_pct < 10 else "trend"
+        b = _build_filler_bullet(r, market, period, mode)
+        bullets.append(b)
+        used_metrics.add(mname)
+
+    while len(bullets) < 4:
+        bullets.append({"metric":"Retention","title":"Retention stability","text":"General Retention remained relatively stable, with no major segment shifts."})
+    return bullets[:4]
+
+def detect_anomalies(df_diff: pd.DataFrame,
+                     market: str,
+                     period: str,
+                     top_n: int = 5,
+                     min_abs_pct: float = 25.0) -> List[Dict[str, Any]]:
+    sub = df_diff[(df_diff["Market"].str.upper()==market.upper()) & (df_diff["Period"].astype(str)==period)].copy()
+    if sub.empty:
+        return []
+    picks = _select_anomalous_rows(sub, top_n=top_n, min_abs_pct=min_abs_pct)
+    bullets: List[Dict[str, Any]] = []
+    for _, r in picks.iterrows():
+        metric = str(r["METRIC"])
+        sign   = 1 if float(r["DIFF_PERCENTAGE"]) >= 0 else -1
+        area_market, ftd_group, figs = _drilldown_ftd_group(metric, period, market, sign)
+
+        # Composite and no group row -> use "General ..." with parent figures
+        if market.upper() in DRILLDOWN and area_market.upper() == market.upper():
+            area_market = "General"
+            ftd_group = None
+            figs = {}
+        use_market = area_market if market.upper() in DRILLDOWN else market
+        bullets.append(_build_bullet(market, period, metric, r, use_market, ftd_group, figs))
+
+    return _ensure_four_bullets(df_diff, bullets, market, period)
 
 # ---------------------------
-# Heuristic fallbacks
+# Runner
 # ---------------------------
-def _best_row_for_metric(df: pd.DataFrame, market: str, period: str, metric_aliases: List[str]) -> Dict[str, Any]:
-    if df.empty:
-        return {}
-    subset = df[(df["Country"].str.upper()==market.upper()) & (df["Period"].astype(str)==period)]
-    if subset.empty:
-        return {}
-    # match metric aliases case-insensitively
-    al = [a.lower() for a in metric_aliases]
-    s = subset[subset["METRIC"].str.lower().isin(al)]
-    if s.empty:
-        return {}
-    # choose the row with the largest absolute DIFF_PERCENTAGE magnitude
-    s = s.copy()
-    s["__abs"] = s["DIFF_PERCENTAGE"].astype(float).abs()
-    s = s.sort_values("__abs", ascending=False)
-    return s.iloc[0].to_dict()
-
-
-def _pick_best(df, market, period, aliases, want='abs', sign=None):
-    #Pick a row for market/period among metric aliases.
-    #want: 'abs' (largest |diff|), 'neg' (most negative diff), 'pos' (most positive diff)
-    #sign: optional override ('neg' or 'pos').
-    #Returns dict(row) or {}.
-    subset = df[(df["Country"].str.upper()==market.upper()) & (df["Period"].astype(str)==period)].copy()
-    if subset.empty: return {}
-    subset["DIFF_PERCENTAGE"] = pd.to_numeric(subset["DIFF_PERCENTAGE"], errors="coerce")
-    subset["VALUE"] = pd.to_numeric(subset["VALUE"], errors="coerce")
-    subset["TARGET"] = pd.to_numeric(subset["TARGET"], errors="coerce")
-    block = subset[subset["METRIC"].str.upper().isin([a.upper() for a in aliases])]
-    if block.empty: 
-        return {}
-    b = block.copy()
-    if (sign or want) == 'neg':
-        b = b.sort_values("DIFF_PERCENTAGE", ascending=True)
-    elif (sign or want) == 'pos':
-        b = b.sort_values("DIFF_PERCENTAGE", ascending=False)
-    else:  # abs
-        b["__abs"] = b["DIFF_PERCENTAGE"].abs()
-        b = b.sort_values("__abs", ascending=False)
-    return b.iloc[0].to_dict() if not b.empty else {}
-
-def _fmt_line(metric, dp, val, tgt, template='generic', direction=None):
-    name = _pretty_metric(metric)
-    # dp may be NaN; guard
-    dp_num = float(dp) if dp is not None else 0.0
-    val_num = float(val) if val is not None else 0.0
-    tgt_num = float(tgt) if tgt is not None else 0.0
-    if template=='critical':
-        return f"{name}: {dp_num:.1f}% vs target ({val_num:,.0f} vs {tgt_num:,.0f}). Immediate attention required."
-    if template=='trend':
-        dir_word = 'growth' if (direction=='up' or dp_num>0) else 'decline'
-        return f"{name} shows {dir_word} of {abs(dp_num):.1f}% vs target. Monitor sustainability."
-    if template=='retention':
-        return f"Retention at {val_num:.1f}% ({dp_num:.1f}% vs target {tgt_num:.1f}%). Review CRM cycles, reactivation and bonus policy."
-    if template=='oppty_margin':
-        # speak in % points feel using explicit values
-        return f"Margin at {val_num:.1f}% ({dp_num:.1f}% vs target {tgt_num:.1f}%). Scale profitable channels."
-    if template=='oppty_generic':
-        sign = '+' if dp_num>=0 else ''
-        return f"{name} outperforming {sign}{dp_num:.1f}% vs target. Consider budget shift."
-    # fallback
-    return f"{name}: {dp_num:.1f}% vs target ({val_num:,.0f} vs {tgt_num:,.0f})."
-
-def _heuristics_four(df: pd.DataFrame, market: str, period: str) -> Dict[str, str]:
-    res = {"critical_alert": None, "trend_analysis": None, "retention_issue": None, "opportunity": None}
-    subset = df[(df["Country"].str.upper()==market.upper()) & (df["Period"].astype(str)==period)].copy()
-    if subset.empty:
-        return {k: "[No data]" for k in res}
-
-    subset["DIFF_PERCENTAGE"] = pd.to_numeric(subset["DIFF_PERCENTAGE"], errors="coerce")
-    subset["VALUE"] = pd.to_numeric(subset["VALUE"], errors="coerce")
-    subset["TARGET"] = pd.to_numeric(subset["TARGET"], errors="coerce")
-
-    # 1) Critical alert — prefer DEPS most negative; else global most negative
-    pick = _pick_best(subset, market, period, DEPS_ALIASES, want='neg')
-    if pick:
-        res["critical_alert"] = _fmt_line(pick["METRIC"], pick["DIFF_PERCENTAGE"], pick["VALUE"], pick["TARGET"], template='critical')
-    else:
-        worst = subset.sort_values("DIFF_PERCENTAGE", ascending=True).head(1)
-        if not worst.empty:
-            r = worst.iloc[0]
-            res["critical_alert"] = _fmt_line(r["METRIC"], r["DIFF_PERCENTAGE"], r["VALUE"], r["TARGET"], template='critical')
-
-    # 2) Retention issue — prefer explicit RETENTION (below target)
-    ret = subset[subset["METRIC"].str.upper().isin(list(RETENTION_ALIASES))].sort_values("DIFF_PERCENTAGE", ascending=True)
-    if not ret.empty:
-        rr = ret.iloc[0]
-        res["retention_issue"] = _fmt_line(rr["METRIC"], rr["DIFF_PERCENTAGE"], rr["VALUE"], rr["TARGET"], template='retention')
-    else:
-        # fallback: second worst metric
-        second = subset.sort_values("DIFF_PERCENTAGE", ascending=True).head(2).tail(1)
-        if not second.empty:
-            r2 = second.iloc[0]
-            res["retention_issue"] = f"{_pretty_metric(r2['METRIC'])} weakness: {float(r2['DIFF_PERCENTAGE']):.1f}% vs target. Investigate cohort drop-offs."
-
-    # 3) Trend analysis — prefer NGR (largest absolute move)
-    trow = _pick_best(subset, market, period, NGR_ALIASES, want='abs')
-    if trow:
-        res["trend_analysis"] = _fmt_line(trow["METRIC"], trow["DIFF_PERCENTAGE"], trow["VALUE"], trow["TARGET"], template='trend')
-    else:
-        trend = subset.copy(); trend["ABS"] = trend["DIFF_PERCENTAGE"].abs()
-        trend = trend.sort_values("ABS", ascending=False).head(1)
-        if not trend.empty:
-            t = trend.iloc[0]
-            res["trend_analysis"] = _fmt_line(t["METRIC"], t["DIFF_PERCENTAGE"], t["VALUE"], t["TARGET"], template='trend')
-
-    # 4) Opportunity — prefer Margin with positive diff; ensure it's not a duplicate and avoid 'small base'
-    mpos = subset[(subset["METRIC"].str.upper().isin(list(MARGIN_ALIASES))) & (subset["DIFF_PERCENTAGE"] > 0)].sort_values("DIFF_PERCENTAGE", ascending=False)
-    if not mpos.empty:
-        m = mpos.iloc[0]
-        res["opportunity"] = _fmt_line(m["METRIC"], m["DIFF_PERCENTAGE"], m["VALUE"], m["TARGET"], template='oppty_margin')
-    else:
-        # fallback: best positive DIFF% on a metric not already used above
-        used_metrics = set()
-        for k in ["critical_alert","trend_analysis","retention_issue"]:
-            txt = res.get(k) or ""
-            # add the first token as metric heuristic
-            mm = re.match(r"([A-Za-z]+)", txt)
-            if mm: used_metrics.add(mm.group(1).upper())
-        pos = subset[subset["DIFF_PERCENTAGE"] > 0].copy()
-        pos["RANK"] = pos["DIFF_PERCENTAGE"]
-        pos = pos.sort_values("RANK", ascending=False)
-        for _, row in pos.iterrows():
-            mname = str(row["METRIC"]).upper()
-            if mname not in used_metrics:
-                res["opportunity"] = _fmt_line(row["METRIC"], row["DIFF_PERCENTAGE"], row["VALUE"], row["TARGET"], template='oppty_generic')
-                break
-        if not res["opportunity"]:
-            res["opportunity"] = "No clear upside detected this period."
-
-    # Final cleanups
-    for k in list(res.keys()):
-        if not res[k]:
-            res[k] = "[No insight]"
-        # avoid "small base" phrasing per requirement
-        res[k] = re.sub(r'small base', 'niche segment', res[k], flags=re.I)
-
-    return res
-
-# ---------------------------
-# Orchestration
-# ---------------------------
-def _reduce_for_prompt(df: pd.DataFrame, market: str, period: str, max_rows: int = 40) -> str:
-    subset = df[(df["Country"].str.upper()==market.upper()) & (df["Period"].astype(str)==period)].copy()
-    if subset.empty:
-        return "Country,Period,METRIC,VALUE,TARGET,DIFF_PERCENTAGE,DIFF_ABSOLUTE,Date\n"
-    cols = [c for c in ["Country","Period","METRIC","VALUE","TARGET","DIFF_PERCENTAGE","DIFF_ABSOLUTE","Date"] if c in subset.columns]
-    subset = subset[cols]
-    # Keep top 12 by absolute diff %, plus RETENTION, plus GLOBAL if present
-    subset["__abs"] = pd.to_numeric(subset["DIFF_PERCENTAGE"], errors="coerce").abs()
-    important = pd.concat([
-        subset.sort_values("__abs", ascending=False).head(12),
-        subset[subset["METRIC"].str.upper()=="RETENTION"]
-    ]).drop_duplicates()
-    # cap max rows
-    reduced = important.head(max_rows).drop(columns=["__abs"], errors="ignore")
-    return reduced.to_csv(index=False)
-
-def _ensure_four_categories(items: List[Dict[str, Any]], heur: Dict[str, str], market: str, period: str) -> Dict[str, str]:
-    # Convert LLM items into our 4-box dict (priority: use LLM, then heuristics)
-    mapping = {"critical_alert": None, "trend_analysis": None, "retention_issue": None, "opportunity": None}
-    for it in items or []:
-        t = str(it.get("type","")).lower().strip()
-        finding = it.get("finding") or it.get("insight") or ""
-        # compact one-liner with action hint
-        if not finding:
-            finding = f"{it.get('metric','').upper()} – {it.get('impact','').strip()}."
-        if t in mapping and not mapping[t]:
-            mapping[t] = finding
-    # fill missing with heuristics
-    for k,v in list(mapping.items()):
-        if not v:
-            mapping[k] = heur.get(k, "[No insight]")
-    return mapping
-
-def _enforce_preferences(mapping: Dict[str,str], df: pd.DataFrame, market: str, period: str) -> Dict[str,str]:
-    #Ensure preferences are met even if LLM didn't follow them.
-    # Prepare subset
-    subset = df[(df["Country"].str.upper()==market.upper()) & (df["Period"].astype(str)==period)].copy()
-    subset["DIFF_PERCENTAGE"] = pd.to_numeric(subset["DIFF_PERCENTAGE"], errors="coerce")
-    subset["VALUE"] = pd.to_numeric(subset["VALUE"], errors="coerce")
-    subset["TARGET"] = pd.to_numeric(subset["TARGET"], errors="coerce")
-
-    # Critical on DEPS if available and negative
-    deps_row = subset[(subset["METRIC"].str.upper().isin(list(DEPS_ALIASES)))].sort_values("DIFF_PERCENTAGE", ascending=True).head(1)
-    if not deps_row.empty and pd.notna(deps_row.iloc[0]["DIFF_PERCENTAGE"]) and float(deps_row.iloc[0]["DIFF_PERCENTAGE"]) < 0:
-        mapping["critical_alert"] = _fmt_line(deps_row.iloc[0]["METRIC"], deps_row.iloc[0]["DIFF_PERCENTAGE"], deps_row.iloc[0]["VALUE"], deps_row.iloc[0]["TARGET"], template='critical')
-
-    # Trend prefer NGR
-    ngr = subset[(subset["METRIC"].str.upper().isin(list(NGR_ALIASES)))].copy()
-    if not ngr.empty:
-        ngr["ABS"] = ngr["DIFF_PERCENTAGE"].abs()
-        r = ngr.sort_values("ABS", ascending=False).iloc[0]
-        mapping["trend_analysis"] = _fmt_line(r["METRIC"], r["DIFF_PERCENTAGE"], r["VALUE"], r["TARGET"], template='trend')
-
-    # Opportunity prefer Margin positive; ensure uniqueness and avoid 'small base'
-    marg = subset[(subset["METRIC"].str.upper().isin(list(MARGIN_ALIASES))) & (subset["DIFF_PERCENTAGE"]>0)].copy()
-    if not marg.empty:
-        m = marg.sort_values("DIFF_PERCENTAGE", ascending=False).iloc[0]
-        mapping["opportunity"] = _fmt_line(m["METRIC"], m["DIFF_PERCENTAGE"], m["VALUE"], m["TARGET"], template='oppty_margin')
-    # De-duplicate if same as another box
-    texts = set()
-    for k in ["critical_alert","trend_analysis","retention_issue"]:
-        if mapping.get(k): texts.add(mapping[k].strip())
-    if mapping.get("opportunity") in texts or not mapping.get("opportunity"):
-        # pick next best positive metric not used by others
-        used = set()
-        for k in ["critical_alert","trend_analysis","retention_issue"]:
-            t = mapping.get(k) or ""
-            mm = re.match(r"([A-Za-z]+)", t)
-            if mm: used.add(mm.group(1).upper())
-        pos = subset[subset["DIFF_PERCENTAGE"]>0].sort_values("DIFF_PERCENTAGE", ascending=False)
-        for _, row in pos.iterrows():
-            if str(row["METRIC"]).upper() not in used:
-                mapping["opportunity"] = _fmt_line(row["METRIC"], row["DIFF_PERCENTAGE"], row["VALUE"], row["TARGET"], template='oppty_generic')
-                break
-        if not mapping.get("opportunity"):
-            mapping["opportunity"] = "No clear upside detected this period."
-
-    # remove banned phrase
-    mapping["opportunity"] = re.sub(r'\bsmall base\b', 'niche segment', mapping["opportunity"], flags=re.I)
-    return mapping
-
-    # Convert LLM items into our 4-box dict (priority: use LLM, then heuristics)
-    mapping = {"critical_alert": None, "trend_analysis": None, "retention_issue": None, "opportunity": None}
-    for it in items or []:
-        t = str(it.get("type","")).lower().strip()
-        finding = it.get("finding") or it.get("insight") or ""
-        # compact one-liner with action hint
-        if not finding:
-            finding = f"{it.get('metric','').upper()} – {it.get('impact','').strip()}."
-        if t in mapping and not mapping[t]:
-            mapping[t] = finding
-    # fill missing with heuristics
-    for k,v in list(mapping.items()):
-        if not v:
-            mapping[k] = heur.get(k, "[No insight]")
-    # Enforce preferences & uniqueness
-    mapping = _enforce_preferences(mapping, df_global_cache, market, period) if 'df_global_cache' in globals() else mapping
-    return mapping
-
 def run():
-    global df_global_cache
-    df = read_csvs_summary()
-    df_global_cache = df
-    mkts = markets_from_files(df)
+    df = read_csvs_differences()
+    # Normalize "OTHERS" to "Others" in data for consistency
+    if not df.empty:
+        df["Market"] = df["Market"].str.replace("^OTHERS$", "Others", regex=True)
+    mkts    = markets_from_files(df)
     periods = periods_from_df(df)
-    today = date.today().strftime("%Y-%m-%d")
-    # Clean previous-dated files from aiPerformanceText
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    today   = date.today().strftime("%Y-%m-%d")
     _cleanup_old_ai_text(OUTPUT_DIR, today)
 
-    client, has_llm = _get_deepseek_client()
-    all_rows = []
-    insights_map = {}  # Market -> Period -> { four boxes }
+    insights_map: Dict[str, Dict[str, Any]] = {}
 
     for market in mkts:
         insights_map.setdefault(market, {})
         for period in periods:
             print(f"→ {market} / {period}")
-            csv_text = _reduce_for_prompt(df, market, period)
-            heur = _heuristics_four(df, market, period)
+            bullets = detect_anomalies(df, market, period, top_n=5, min_abs_pct=25.0)
+            insights_map[market][period] = {"bullets": bullets}
 
-            llm_items = []
-            if has_llm and csv_text.strip():
-                try:
-                    messages = [
-                        {"role": "system", "content": LLM_SYSTEM},
-                        {"role": "user", "content": LLM_USER_TEMPLATE.format(market=market, period=period, csv_text=csv_text)}
-                    ]
-                    resp = _safe_chat_complete(client, messages)
-                    raw = resp.choices[0].message.content
-                    llm_items = _extract_json(raw)
-                except Exception as e:
-                    print("⚠️ LLM failure; using heuristics", e)
-
-            four = _ensure_four_categories(llm_items, heur, market, period)
-            # collect full record rows for JSON dump
-            for k, txt in four.items():
-                all_rows.append({
-                    "market": market,
-                    "period": period,
-                    "type": k,
-                    "text": txt
-                })
-            insights_map[market][period] = {
-                "critical_alert": four["critical_alert"],
-                "trend_analysis": four["trend_analysis"],
-                "retention_issue": four["retention_issue"],
-                "opportunity": four["opportunity"],
-            }
-
-    # Outputs
+    # outputs
     out_json = os.path.join(OUTPUT_DIR, f"anomalies_{today}.json")
     with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(all_rows, f, ensure_ascii=False, indent=2)
-    print("✔ Wrote", out_json)
+        json.dump(insights_map, f, ensure_ascii=False, indent=2)
 
-    # Dated JS for the dashboard
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
     dated_js = os.path.join(OUTPUT_DIR, f"{today}_main-insights.js")
     with open(dated_js, "w", encoding="utf-8") as f2:
         f2.write("window.AI_INSIGHTS = ")
         json.dump(insights_map, f2, ensure_ascii=False)
         f2.write(";")
-    print("✔ Wrote", dated_js)
-
-    
 
 if __name__ == "__main__":
     run()

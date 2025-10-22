@@ -973,7 +973,7 @@ while (retry_attempts < max_retries && !connection_successful) {
     
     agg_period <- function(df, start_date, end_date) {
       df %>%
-        filter(Date >= start_date, Date <= end_date, METRIC %in% metrics_base) %>%
+        filter(Date >= start_date, Date <= end_date, METRIC %in% c("DEPs","FTDs","GGR","STAKE","NGR","RMPs")) %>%
         group_by(Market, METRIC) %>%
         summarise(VALUE = sum(VALUE, na.rm = TRUE), .groups = "drop") %>%
         pivot_wider(names_from = METRIC, values_from = VALUE) %>%
@@ -1030,20 +1030,13 @@ while (retry_attempts < max_retries && !connection_successful) {
     
     # Retention
     # Build daily RMP/FTD (include 'ALL' aggregate so it matches df_ret)
-    daily_raw <- df %>%
+    daily <- df %>%
       filter(METRIC %in% c("RMPs","FTDs")) %>%
       group_by(Date, Market, METRIC) %>%
       summarise(VALUE = sum(VALUE, na.rm = TRUE), .groups = "drop") %>%
       pivot_wider(names_from = METRIC, values_from = VALUE, values_fill = 0) %>%
       rename(RMP = RMPs, FTD = FTDs)
     
-    daily_all <- daily_raw %>%
-      group_by(Date) %>%
-      summarise(RMP = sum(RMP, na.rm = TRUE),
-                FTD = sum(FTD, na.rm = TRUE), .groups = "drop") %>%
-      mutate(Market = "ALL")
-    
-    daily <- bind_rows(daily_raw, daily_all)
     
     eom <- function(d) floor_date(d, "month") %m+% months(1) - days(1)
     
@@ -1142,7 +1135,8 @@ while (retry_attempts < max_retries && !connection_successful) {
         SUM(b.Total_STAKE)       AS STAKE,
         SUM(b.Total_GGR)         AS GGR,
         SUM(b.Total_NGR)         AS NGR,
-        COUNT(DISTINCT CASE WHEN b.RMP = 1 THEN b.PARTYID END) AS RMPs
+        COUNT(DISTINCT CASE WHEN b.RMP = 1 THEN b.PARTYID END) AS RMPs,
+        COUNT(DISTINCT CASE WHEN b.FTD = 1 THEN b.PARTYID END) AS FTDs
     FROM V_BI_MASTER_BASE_DAILY_GAME_CATEGORY AS b
     INNER JOIN (SELECT PARTYID, [Date], FTD_Since_Months FROM bi_data.dbo.RetentionUsers WHERE [Date] >= '2024-10-01') AS u
         ON u.PARTYID = b.PARTYID
@@ -1189,7 +1183,8 @@ while (retry_attempts < max_retries && !connection_successful) {
         SUM(b.Total_STAKE)       AS STAKE,
         SUM(b.Total_GGR)         AS GGR,
         SUM(b.Total_NGR)         AS NGR,
-        COUNT(DISTINCT CASE WHEN b.RMP = 1 THEN b.PARTYID END) AS RMPs
+        COUNT(DISTINCT CASE WHEN b.RMP = 1 THEN b.PARTYID END) AS RMPs,
+        COUNT(DISTINCT CASE WHEN b.FTD = 1 THEN b.PARTYID END) AS FTDs
     FROM V_BI_MASTER_BASE_DAILY_GAME_CATEGORY AS b
     INNER JOIN bi_data.dbo.Users AS us
         ON us.GL_ACCOUNT = b.PARTYID
@@ -1227,7 +1222,8 @@ while (retry_attempts < max_retries && !connection_successful) {
           SUM(b.Total_STAKE)                                           AS STAKE,
           SUM(b.Total_GGR)                                             AS GGR,
           SUM(b.Total_NGR)                                             AS NGR,
-          COUNT(DISTINCT CASE WHEN b.RMP = 1 THEN b.PARTYID END)       AS RMPs
+          COUNT(DISTINCT CASE WHEN b.RMP = 1 THEN b.PARTYID END)       AS RMPs,
+          COUNT(DISTINCT CASE WHEN b.FTD = 1 THEN b.PARTYID END)       AS FTDs
       FROM V_BI_MASTER_BASE_DAILY_GAME_CATEGORY AS b
       JOIN (
           SELECT PARTYID, [Date], FTD_Since_Months
@@ -1275,7 +1271,8 @@ while (retry_attempts < max_retries && !connection_successful) {
           SUM(b.Total_STAKE)                                           AS STAKE,
           SUM(b.Total_GGR)                                             AS GGR,
           SUM(b.Total_NGR)                                             AS NGR,
-          COUNT(DISTINCT CASE WHEN b.RMP = 1 THEN b.PARTYID END)       AS RMPs
+          COUNT(DISTINCT CASE WHEN b.RMP = 1 THEN b.PARTYID END)       AS RMPs,
+          COUNT(DISTINCT CASE WHEN b.FTD = 1 THEN b.PARTYID END)       AS FTDs
       FROM V_BI_MASTER_BASE_DAILY_GAME_CATEGORY AS b
       JOIN (
           SELECT PARTYID, [Date], FTD_Since_Months
@@ -1326,7 +1323,7 @@ while (retry_attempts < max_retries && !connection_successful) {
     
     df <- df %>%
       pivot_longer(
-        cols = c(DEPs, NET, STAKE, GGR, NGR, Margin, RMPs),
+        cols = c(DEPs, NET, STAKE, GGR, NGR, Margin, RMPs, FTDs),
         names_to = "METRIC",
         values_to = "VALUE"
       ) %>%
@@ -1336,6 +1333,41 @@ while (retry_attempts < max_retries && !connection_successful) {
     # Round all except margin
     df <- df %>%
       mutate(VALUE = if_else(METRIC != "Margin", round(VALUE, 0), VALUE))
+    
+    # Retention
+    # Build daily RMP/FTD (include 'ALL' aggregate so it matches df_ret)
+    daily <- df %>%
+      filter(METRIC %in% c("RMPs","FTDs")) %>%
+      group_by(Date, Market, FTD_Group, METRIC) %>%
+      summarise(VALUE = sum(VALUE, na.rm = TRUE), .groups = "drop") %>%
+      pivot_wider(names_from = METRIC, values_from = VALUE, values_fill = 0) %>%
+      rename(RMP = RMPs, FTD = FTDs)
+    
+    df_ret <- daily %>%
+      arrange(Market, FTD_Group, Date) %>%
+      group_by(Market, FTD_Group) %>%
+      mutate(
+        RMP_prev  = lag(RMP),
+        Retention = if_else(
+          is.na(RMP_prev) | RMP_prev == 0,
+          NA_real_,
+          round(100 * (RMP - FTD) / RMP_prev, 2)  # percent, 2 decimals
+        )
+      ) %>%
+      transmute(Date, Market, FTD_Group, Retention) %>%
+      ungroup()
+    
+    df_ret <- df_ret %>%
+      pivot_longer(
+        cols = c(Retention),
+        names_to = "METRIC",
+        values_to = "VALUE"
+      ) %>%
+      group_by(Date, Market, FTD_Group, METRIC) %>%
+      summarise(VALUE = sum(VALUE, na.rm = TRUE), .groups = "drop")
+    
+    df <- rbind(df, df_ret)
+    
     
     # Ensure Date is Date type
     df$Date <- as.Date(df$Date)
@@ -1352,6 +1384,33 @@ while (retry_attempts < max_retries && !connection_successful) {
       pivot_longer(-c(Week, Market, FTD_Group),
                    names_to = "METRIC", values_to = "VALUE") %>%
       rename(Date = Week)
+ 
+    df_ret_weekly <- daily %>%
+      mutate(Week = floor_date(Date, "week", week_start = 1)) %>%
+      group_by(Market, FTD_Group, Week) %>%
+      summarise(
+        FTD_period = sum(FTD, na.rm = TRUE),
+        # RMP at the last available date of the week (period end)
+        RMP_end = RMP[which.max(Date)],
+        .groups = "drop"
+      ) %>%
+      arrange(Market, FTD_Group, Week) %>%
+      group_by(Market, FTD_Group) %>%
+      mutate(
+        RMP_prev = lag(RMP_end),
+        Retention = if_else(
+          is.na(RMP_prev) | RMP_prev == 0,
+          NA_real_,
+          round(100 * (RMP_end - FTD_period) / RMP_prev, 2)
+        )
+      ) %>%
+      transmute(
+        Date = Week, Market, FTD_Group,
+        METRIC = "Retention", VALUE = Retention
+      ) %>%
+      ungroup()
+    
+    df_weekly <- bind_rows(df_weekly, df_ret_weekly)
     
     # --- MONTHLY ---
     df_monthly <- df %>%
@@ -1365,6 +1424,32 @@ while (retry_attempts < max_retries && !connection_successful) {
                    names_to = "METRIC", values_to = "VALUE") %>%
       rename(Date = Month)
     
+    df_ret_monthly <- daily %>%
+      mutate(Month = floor_date(Date, "month")) %>%
+      group_by(Market, FTD_Group, Month) %>%
+      summarise(
+        FTD_period = sum(FTD, na.rm = TRUE),
+        RMP_end = RMP[which.max(Date)],  # last available date in the month
+        .groups = "drop"
+      ) %>%
+      arrange(Market, FTD_Group, Month) %>%
+      group_by(Market, FTD_Group) %>%
+      mutate(
+        RMP_prev = lag(RMP_end),
+        Retention = if_else(
+          is.na(RMP_prev) | RMP_prev == 0,
+          NA_real_,
+          round(100 * (RMP_end - FTD_period) / RMP_prev, 2)
+        )
+      ) %>%
+      transmute(
+        Date = Month, Market, FTD_Group,
+        METRIC = "Retention", VALUE = Retention
+      ) %>%
+      ungroup()
+    
+    df_monthly <- bind_rows(df_monthly, df_ret_monthly)
+    
     # --- MTD ---
     df_MTD <- df %>%
       filter(METRIC %in% c("DEPs","FTDs","GGR","STAKE","NGR","RMPs"),
@@ -1377,6 +1462,33 @@ while (retry_attempts < max_retries && !connection_successful) {
       pivot_longer(-c(Month, Market, FTD_Group),
                    names_to = "METRIC", values_to = "VALUE") %>%
       rename(Date = Month)
+    
+    df_ret_MTD <- daily %>%
+      filter(day(Date) <= day(yesterday)) %>%
+      mutate(Month = floor_date(Date, "month")) %>%
+      group_by(Market, FTD_Group, Month) %>%
+      summarise(
+        FTD_period = sum(FTD, na.rm = TRUE),
+        RMP_end = RMP[which.max(Date)],  # last available date within the restricted MTD window
+        .groups = "drop"
+      ) %>%
+      arrange(Market, FTD_Group, Month) %>%
+      group_by(Market, FTD_Group) %>%
+      mutate(
+        RMP_prev = lag(RMP_end),
+        Retention = if_else(
+          is.na(RMP_prev) | RMP_prev == 0,
+          NA_real_,
+          round(100 * (RMP_end - FTD_period) / RMP_prev, 2)
+        )
+      ) %>%
+      transmute(
+        Date = Month, Market, FTD_Group,
+        METRIC = "Retention", VALUE = Retention
+      ) %>%
+      ungroup()
+    
+    df_MTD <- bind_rows(df_MTD, df_ret_MTD)
     
     # Get unique combinations of Market and METRIC
     combos <- unique(df[, c("Market", "METRIC")])
@@ -1457,7 +1569,7 @@ while (retry_attempts < max_retries && !connection_successful) {
     )
     
     # Keep only metrics of interest
-    df_filtered <- df %>% filter(METRIC %in% c("DEPs", "RMPs", "NGR"))
+    df_filtered <- df %>% filter(METRIC %in% c("DEPs", "RMPs", "NGR", "Retention", "STAKE", "Margin"))
     
     # Function to calculate sums and compare with previous period
     calc_period <- function(name, dates) {

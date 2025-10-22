@@ -850,62 +850,47 @@ function _pickKey(obj, key){
   if(norm==='OTHERS'){ for(var k=0;k<ks.length;k++){ if(String(ks[k]).toUpperCase()==='OTHERS') return ks[k]; } }
   return null;
 }
-function _getInsightMap(mkt, per){
+function _getBullets(mkt, per){
   var M = (window.AI_INSIGHTS||{});
   var mk = _pickKey(M, mkt);
-  if(!mk) return null;
+  if(!mk) return [];
   var P = M[mk] || {};
   var pk = _pickKey(P, per);
-  return pk ? P[pk] : null;
+  var obj = pk ? P[pk] : null;
+  var arr = (obj && Array.isArray(obj.bullets)) ? obj.bullets : [];
+  return arr.map(function(b){
+    if (typeof b === 'string') {
+      var m = (b.split('—')[1]||'').split(' ')[0] || 'Insight';
+      return { metric: m, title: (m? m + ' anomaly' : 'Insight'), text: b };
+    }
+    var title = b.title || (b.metric ? (b.metric + ' anomaly') : 'Insight');
+    return { metric: b.metric || 'Insight', title: title, text: String(b.text||'') };
+  });
 }
-
-
-
-function _setInsightText(boxId, txt){
+function _setInsight(boxId, title, text){
   var box = document.getElementById(boxId);
   if(!box) return;
-  var t = box.querySelector('.insight-text');
-  if(!t){ t = document.createElement('div'); t.className = 'insight-text'; box.appendChild(t); }
-
-  var s = (txt==null||txt===undefined||txt==='') ? '[No insight]' : String(txt).trim();
-
-  // SPECIAL CASE: if the sentence is "No: clear upside detected this period." or similar,
-  // render it without bold and without the colon.
+  var lab = box.querySelector('.insight-label');
+  var body = box.querySelector('.insight-text');
+  if(!lab){ lab = document.createElement('div'); lab.className='insight-label'; box.prepend(lab); }
+  if(!body){ body = document.createElement('div'); body.className='insight-text'; box.appendChild(body); }
+  var s = (text==null||text===undefined||text==='') ? '[No insight]' : String(text).trim();
   var sl = s.toLowerCase().replace(/\s+/g,' ').trim();
   if (sl === 'no clear upside detected this period.' || sl === 'no: clear upside detected this period.') {
-    t.textContent = 'No clear upside detected this period.';
-    return;
+    s = 'No clear upside detected this period.';
   }
-
-  function splitLabel(str){
-    var i = str.indexOf(':');
-    if(i>0 && i<=24){ return {label: str.slice(0,i).trim(), tail: str.slice(i+1)}; }
-    var m = str.match(/^\s*([A-Za-z]+)\b(.*)$/);
-    if(m){ return {label: m[1], tail: m[2]||''}; }
-    return {label:'', tail:str};
-  }
-
-  var parts = splitLabel(s);
-  var lab = parts.label;
-
-  t.innerHTML = '';
-  if(lab){
-    var b = document.createElement('strong'); b.textContent = lab + ':';
-    t.appendChild(b);
-    t.appendChild(document.createTextNode(parts.tail));
-  }else{
-    t.textContent = s;
-  }
+  lab.textContent = title || 'Insight';
+  body.textContent = s;
 }
 function renderInsights(){
   var pEl=document.getElementById('periodSelect'), mEl=document.getElementById('marketSelect');
   if(!pEl||!mEl) return;
   var p=pEl.value, m=mEl.value;
-  var data=_getInsightMap(m,p);
-  _setInsightText('insCritical',   data && data.critical_alert);
-  _setInsightText('insTrend',      data && data.trend_analysis);
-  _setInsightText('insRetention',  data && data.retention_issue);
-  _setInsightText('insOpportunity',data && data.opportunity);
+  var bullets=_getBullets(m,p);
+  _setInsight('insCritical',    bullets[0]?.title,    bullets[0]?.text);
+  _setInsight('insTrend',       bullets[1]?.title,    bullets[1]?.text);
+  _setInsight('insRetention',   bullets[2]?.title,    bullets[2]?.text);
+  _setInsight('insOpportunity', bullets[3]?.title,    bullets[3]?.text);
 }
 document.addEventListener('DOMContentLoaded', function(){
   try{ renderInsights(); }catch(e){}
